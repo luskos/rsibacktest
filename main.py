@@ -1,202 +1,209 @@
 import ccxt
 import pandas as pd
 import numpy as np
-import websocket
-import json
-import os
 import time
+from datetime import datetime
+import os
 import logging
-
-# -----------------------------
-# 1. Set up Binance Testnet API
-# -----------------------------
-api_key = 'krw2RrP26ttZgRrC2Lw8N9yF6TeqsUXM3kzplDON9a8crjAkohpFwuL8SIEOFd7e'
-api_secret = 'UAqSx1RxvGjQUVOUd4KEarIvokcXio0MLQogQlD7LLinmzREj4zYWBbRu9anLiMg'
+ 
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+ 
+# Set up Binance API with your API key and secret
+api_key = os.getenv('BINANCE_API_KEY')
+api_secret = os.getenv('BINANCE_API_SECRET')
 binance = ccxt.binance({
     'apiKey': api_key,
     'secret': api_secret,
     'enableRateLimit': True,
-    'urls': {
-        'api': {
-            'public': 'https://testnet.binance.vision/api/v3',
-            'private': 'https://testnet.binance.vision/api/v3',
-        },
-    },
 })
-
-# -----------------------------
-# 2. Define Parameters
-# -----------------------------
-symbol = 'BTC/USDC'  # Use USDT instead of USDC on Testnet
-timeframe = '1h'
-
-# Risk management parameters
-risk_reward_ratio = 0.25
-atr_multiplier = 1.5
-risk_per_trade = 0.25
-
-# Trailing stop parameters
-trailing_stop_enabled = True
-trailing_stop_multiplier = 1.0
-
-# Grid trading parameters
-max_grid_trades = 1
-grid_spacing_factor = 2.0
-grid_exit_factor = 1.0
-min_avg_grid_profit = -0.02
-
-# Initialize balance and trade tracking
-balance = float(binance.fetch_balance()['total']['USDC'])  # Fetch initial balance
-open_trades = []
-closed_trades = []
-
-# Logging
-logging.basicConfig(filename='trading_bot.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logging.info("Starting live trading bot")
-
-# -----------------------------
-# 3. Indicator Calculations
-# -----------------------------
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(window=period, min_periods=period).mean()
-    avg_loss = loss.rolling(window=period, min_periods=period).mean()
-    rs = avg_gain / avg_loss
+ 
+# Trading parameters
+symbol = 'ETH/USDC'
+timeframe = '1m'  # Use 1-minute candles
+trading_fee = 0.00075  # 0.075% Binance trading fee
+rsi_period = 14  # RSI period
+rsi_buy_threshold = 31  # Buy when RSI < 31
+rsi_sell_threshold = 60  # Sell when RSI > 70
+take_profit = 0.04  # 4% take profit
+stop_loss = 0.02  # 2% stop loss
+ 
+# Initialize variables
+position = 0  # 0 = no position, 1 = long position
+entry_price = 0  # Price at which the position was opened
+trade_history = []
+ 
+def fetch_initial_data():
+    """Fetch historical OHLCV data from Binance"""
+    logging.info("Fetching initial OHLCV data...")
+    ohlcv = binance.fetch_ohlcv(symbol, timeframe, limit=100)  # Fetch 100 candles
+    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    return df
+ 
+def fetch_latest_candle():
+    """Fetch the latest candle for live trading"""
+    ohlcv = binance.fetch_ohlcv(symbol, timeframe, limit=1)  # Fetch the latest 1-minute candle
+    latest_candle = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    latest_candle['timestamp'] = pd.to_datetime(latest_candle['timestamp'], unit='ms')
+    return latest_candle.iloc[0]
+ 
+def calculate_rsi(data, period=14):
+    """Calculate RSI (Relative Strength Index)"""
+    delta = data['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
     rsi = 100 - (100 / (1 + rs))
     return rsi
-
-def calculate_indicators(df):
-    df['rsi'] = calculate_rsi(df['close'], period=14)
-    rolling_mean = df['close'].rolling(20).mean()
-    rolling_std = df['close'].rolling(15).std()
-    df['boll_upper'] = rolling_mean + 2 * rolling_std
-    df['boll_lower'] = rolling_mean - 1 * rolling_std
-    df['atr'] = (df['high'] - df['low']).rolling(14).mean()
-    df['sma50'] = df['close'].rolling(45).mean()
-    df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
-    df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
-    df['macd'] = df['ema12'] - df['ema26']
-    df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-    df['macd_hist'] = df['macd'] - df['macd_signal']
-
-# -----------------------------
-# 4. Trade Management Functions
-# -----------------------------
-def open_trade(trade_type, price, atr_value):
-    stop_loss_distance = atr_value * atr_multiplier
-    position_size = (balance * risk_per_trade) / stop_loss_distance
-    if trade_type == 1:  # Long
-        stop_loss = price - stop_loss_distance
-        take_profit = price + stop_loss_distance * risk_reward_ratio
-    else:  # Short
-        stop_loss = price + stop_loss_distance
-        take_profit = price - stop_loss_distance * risk_reward_ratio
-    return {
-        'type': trade_type,
-        'entry_price': price,
-        'position_size': position_size,
-        'stop_loss': stop_loss,
-        'take_profit': take_profit,
-    }
-
-def check_trade_exit(trade, candle):
-    if trade['type'] == 1:
-        if candle['low'] <= trade['stop_loss'] or candle['high'] >= trade['take_profit']:
-            return True
-    else:
-        if candle['high'] >= trade['stop_loss'] or candle['low'] <= trade['take_profit']:
-            return True
-    return False
-
-def update_trade_trailing_stop(trade, current_close, atr_value):
-    if trade['type'] == 1:
-        new_stop = current_close - (atr_value * trailing_stop_multiplier)
-        if new_stop > trade['stop_loss']:
-            trade['stop_loss'] = new_stop
-    else:
-        new_stop = current_close + (atr_value * trailing_stop_multiplier)
-        if new_stop < trade['stop_loss']:
-            trade['stop_loss'] = new_stop
-
-# -----------------------------
-# 5. WebSocket for Real-Time Data
-# -----------------------------
-def on_message(ws, message):
-    data = json.loads(message)
-    candle = data['k']
-    latest_candle = {
-        'timestamp': candle['t'],
-        'open': float(candle['o']),
-        'high': float(candle['h']),
-        'low': float(candle['l']),
-        'close': float(candle['c']),
-        'volume': float(candle['v']),
-    }
-    process_new_candle(latest_candle)
-
-def on_error(ws, error):
-    logging.error(f"WebSocket error: {error}")
-
-def on_close(ws, close_status_code, close_msg):
-    logging.info("WebSocket connection closed")
-
-def on_open(ws):
-    logging.info("WebSocket connection opened")
-
-# Start WebSocket connection
-websocket_url = "wss://testnet.binance.vision/ws/btcusdc@kline_1h"
-ws = websocket.WebSocketApp(websocket_url, on_message=on_message, on_error=on_error, on_close=on_close)
-ws.on_open = on_open
-
-# -----------------------------
-# 6. Live Trading Logic
-# -----------------------------
-def process_new_candle(candle):
-    global balance, open_trades, closed_trades
-
-    # Create a DataFrame for the latest candle
-    df = pd.DataFrame([candle])
-    calculate_indicators(df)
-
-    current_price = df['close'].iloc[-1]
-    atr_value = df['atr'].iloc[-1]
-
-    # Check for exit conditions on open trades
-    trades_to_close = []
-    for idx, trade in enumerate(open_trades):
-        if check_trade_exit(trade, candle):
-            side = 'sell' if trade['type'] == 1 else 'buy'
-            quantity = trade['position_size']
-            order = binance.create_order(symbol, 'market', side, quantity)
-            if order:
-                profit = (current_price - trade['entry_price']) * trade['position_size'] if trade['type'] == 1 else (trade['entry_price'] - current_price) * trade['position_size']
-                balance += profit
-                closed_trades.append({**trade, 'exit_price': current_price, 'profit': profit})
-                trades_to_close.append(idx)
-                logging.info(f"Closed trade: {trade}, Profit: {profit:.2f} USDC")
-
-    # Remove closed trades
-    for idx in sorted(trades_to_close, reverse=True):
-        del open_trades[idx]
-
-    # Check for entry signals
-    entry_signal = calculate_entry_signal(df)
-    if entry_signal != 0 and len(open_trades) < max_grid_trades:
-        new_trade = open_trade(entry_signal, current_price, atr_value)
-        side = 'buy' if entry_signal == 1 else 'sell'
-        quantity = new_trade['position_size']
-        order = binance.create_order(symbol, 'market', side, quantity)
-        if order:
-            open_trades.append(new_trade)
-            logging.info(f"Opened new trade: {new_trade}")
-
-# Start WebSocket in a separate thread
-import threading
-ws_thread = threading.Thread(target=ws.run_forever)
-ws_thread.start()
-
-# Keep the main thread alive
-while True:
-    time.sleep(1)
+ 
+ 
+def get_usdc_balance():
+    """Fetch the USDC balance from the Binance account"""
+    try:
+        balance = binance.fetch_balance()
+        usdc_balance = balance['total']['USDC']
+        logging.info(f"Current USDC Balance: {usdc_balance}")
+        return usdc_balance
+    except Exception as e:
+        logging.error(f"Error fetching USDC balance: {e}")
+        return None
+ 
+def place_order(side, amount, price):
+    """Place a market order on Binance"""
+    try:
+        order = binance.create_order(symbol, 'market', side, amount, price)
+        logging.info(f"Order placed: {order}")
+        return order
+    except Exception as e:
+        logging.error(f"Error placing order: {e}")
+        return None
+ 
+def get_eth_balance():
+    """Fetch the ETH balance from the Binance account"""
+    try:
+        balance = binance.fetch_balance()
+        eth_balance = balance['total'].get('ETH', 0)  # Ensure ETH key exists
+        logging.info(f"Current ETH Balance: {eth_balance}")
+        return eth_balance
+    except Exception as e:
+        logging.error(f"Error fetching ETH balance: {e}")
+        return None
+ 
+def live_trade():
+    """Live trading function"""
+    logging.info("Starting live trading...")
+ 
+    # Fetch initial data
+    ohlcv_data = fetch_initial_data()
+    global position, entry_price  # Use global variables to retain state
+ 
+    while True:
+        try:
+            # Fetch the latest candle
+            latest_candle = fetch_latest_candle()
+            ohlcv_data = pd.concat([ohlcv_data.iloc[1:], pd.DataFrame([latest_candle])], ignore_index=True)
+ 
+            # Calculate RSI and SMA50
+            ohlcv_data['RSI'] = calculate_rsi(ohlcv_data, period=rsi_period)
+ 
+            latest_row = ohlcv_data.iloc[-1]
+            current_price = latest_row['close']
+            rsi = latest_row['RSI']
+ 
+            logging.info(f"Current Price: {current_price:.2f} USDC, RSI: {rsi:.2f}")
+ 
+            # Fetch USDC balance
+            usdc_balance = get_usdc_balance()
+            if usdc_balance is None:
+                time.sleep(10)
+                continue
+ 
+            # Calculate trade amount (leave $1 margin)
+            trade_amount = max(usdc_balance - 2, 0)
+ 
+            # Buy condition: RSI < threshold AND price > SMA50
+            if rsi < rsi_buy_threshold and position == 0:
+                amount = (trade_amount / current_price) * (1 - trading_fee)  # Apply fee
+                order = place_order('buy', amount, current_price)
+                if order:
+                    position = 1
+                    entry_price = current_price
+                    logging.info(f"BUY {amount:.6f} ETH at {entry_price:.2f} USDC")
+ 
+            # Sell condition
+            if rsi > rsi_sell_threshold and position == 1:
+                eth_balance = get_eth_balance()
+                if eth_balance and eth_balance > 0:
+                    order = place_order('sell', eth_balance, current_price)
+                    if order:
+                        position = 0
+                        exit_price = current_price
+                        pnl = (exit_price - entry_price) * eth_balance
+                        trade_history.append({'entry_price': entry_price, 'exit_price': exit_price, 'PnL': pnl})
+                        logging.info(f"SELL {eth_balance:.6f} ETH at {exit_price:.2f} USDC | PnL: {pnl:.2f} USDC")
+                else:
+                    logging.warning("Insufficient ETH balance for selling.")
+ 
+           # Stop-loss and take-profit conditions
+ 
+            if position == 1:
+ 
+                if current_price >= entry_price * (1 + take_profit):
+ 
+                    amount = binance.fetch_balance()['total']['ETH']
+ 
+                    order = place_order('sell', amount, current_price)
+ 
+                    if order:
+ 
+                        position = 0
+ 
+                        exit_price = current_price
+ 
+                        pnl = (exit_price - entry_price) * amount
+ 
+                        trade_history.append({'entry_price': entry_price, 'exit_price': exit_price, 'PnL': pnl})
+ 
+                        logging.info(f"TAKE PROFIT: SELL {amount:.6f} ETH at {exit_price:.2f} USDC | PnL: {pnl:.2f} USDC")
+ 
+                elif current_price <= entry_price * (1 - 0.01):  # 1% stop-loss
+ 
+                    amount = binance.fetch_balance()['total']['ETH']
+ 
+                    order = place_order('sell', amount, current_price)
+ 
+                    if order:
+ 
+                        position = 0
+ 
+                        exit_price = current_price
+ 
+                        pnl = (exit_price - entry_price) * amount
+ 
+                        trade_history.append({'entry_price': entry_price, 'exit_price': exit_price, 'PnL': pnl})
+ 
+                        logging.info(f"STOP LOSS: SELL {amount:.6f} ETH at {exit_price:.2f} USDC | PnL: {pnl:.2f} USDC")
+ 
+                        # Re-enter buy position after stop-loss
+ 
+                        if rsi < rsi_buy_threshold:
+ 
+                            amount = (trade_amount / current_price) * (1 - trading_fee)  # Apply fee
+ 
+                            order = place_order('buy', amount, current_price)
+ 
+                            if order:
+ 
+                                position = 1
+ 
+                                entry_price = current_price
+ 
+                                logging.info(f"RE-ENTER BUY {amount:.6f} ETH at {entry_price:.2f} USDC")
+            time.sleep(60)  # Wait for the next candle
+        except Exception as e:
+            logging.error(f"Error in live trading loop: {e}")
+            time.sleep(10)
+ 
+# Start live trading
+live_trade()
